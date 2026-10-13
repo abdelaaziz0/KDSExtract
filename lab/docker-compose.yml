@@ -1,0 +1,61 @@
+services:
+  dc-vuln:
+    build:
+      context: .
+      dockerfile: Dockerfile.samba
+      args:
+        SAMBA_VERSION: "4.24.4"
+    image: kdsextract/samba:4.24.4-vuln
+    container_name: kdse-dc-vuln
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    environment: &dc-env
+      REALM: lab.local
+      DOMAIN: LAB
+      ADMIN_PASSWORD: Admin123!
+      GMSA_NAME: svcgmsa
+      LOWPRIV_USER: lowpriv
+      LOWPRIV_PASSWORD: Lowpriv123!
+    networks:
+      - lab
+    ports:
+      - "127.0.0.1:1389:389"
+
+  dc-fixed:
+    build:
+      context: .
+      dockerfile: Dockerfile.samba
+      args:
+        SAMBA_VERSION: "4.24.5"
+    image: kdsextract/samba:4.24.5-fixed
+    container_name: kdse-dc-fixed
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    environment: *dc-env
+    networks:
+      - lab
+    ports:
+      - "127.0.0.1:2389:389"
+
+  attacker:
+    build:
+      context: ..
+      dockerfile: lab/Dockerfile.attacker
+    image: kdsextract/attacker:latest
+    container_name: kdse-attacker
+    depends_on:
+      dc-vuln:
+        condition: service_healthy
+      dc-fixed:
+        condition: service_healthy
+    networks:
+      - lab
+    entrypoint: ["sleep", "infinity"]
+
+networks:
+  lab:
+    name: kdsextract-lab

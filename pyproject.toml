@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kdsextract"
+version = "0.1.0"
+description = "CVE-2026-58222 (Samba AD LDAP Compare filter injection) oracle: recover confidential attributes (KDS root keys) and derive gMSA passwords"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "KDSExtract" }]
+keywords = ["cve-2026-58222", "samba", "ldap", "gmsa", "gkdi", "ad"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+
+[project.scripts]
+kdsextract = "kdsextract.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools]
+packages = ["kdsextract"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
